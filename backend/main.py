@@ -20,8 +20,11 @@ from pydantic import BaseModel
 import requests
 from bs4 import BeautifulSoup
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from requests.exceptions import SSLError
+from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
+from html import unescape
 
 # Topic modelling libraries.  scikit‑learn is used for a simple TF‑IDF approach.
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -40,6 +43,40 @@ class AnalyzeRequest(BaseModel):
     """Model for incoming analyze requests."""
 
     url: str
+
+
+def _google_news_fallback_text(source_url: str, headers: Dict[str, str]) -> str:
+    """Build analyzable text from Google News RSS when direct article fetch is blocked."""
+    parsed = urlparse(source_url)
+    host = parsed.netloc.replace("www.", "")
+    path_hint = parsed.path.strip("/").split("/")[0] if parsed.path.strip("/") else ""
+    q = f"site:{host}"
+    if path_hint:
+        q += f" {path_hint}"
+    rss_url = (
+        "https://news.google.com/rss/search?"
+        f"q={q.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
+    )
+    feed = requests.get(rss_url, timeout=15, headers=headers, allow_redirects=True)
+    if feed.status_code != 200 or not feed.text.strip():
+        return ""
+    chunks: List[str] = []
+    try:
+        root = ET.fromstring(feed.text)
+        items = root.findall(".//item")[:40]
+        for item in items:
+            title_el = item.find("title")
+            desc_el = item.find("description")
+            title = (title_el.text or "").strip() if title_el is not None else ""
+            desc = (desc_el.text or "").strip() if desc_el is not None else ""
+            # Remove markup from RSS description payload.
+            desc = re.sub(r"<[^>]+>", " ", unescape(desc))
+            snippet = re.sub(r"\s+", " ", f"{title}. {desc}").strip()
+            if snippet:
+                chunks.append(snippet)
+    except ET.ParseError:
+        return ""
+    return re.sub(r"\s+", " ", " ".join(chunks)).strip()
 
 
 def extract_article_text(url: str) -> str:
@@ -67,16 +104,42 @@ def extract_article_text(url: str) -> str:
         ),
         "Accept-Language": "en-US,en;q=0.9",
     }
-    try:
-        response = requests.get(url, timeout=10, headers=headers)
-    except SSLError:
-        # Some environments (corporate proxies/self-signed chains) break TLS verification.
-        # Retry without certificate verification so local demos continue to work.
-        response = requests.get(url, timeout=10, headers=headers, verify=False)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch URL: {exc}")
+    def _safe_get(target: str, timeout: int = 10) -> Optional[requests.Response]:
+        try:
+            return requests.get(target, timeout=timeout, headers=headers, allow_redirects=True)
+        except SSLError:
+            # Some environments (corporate proxies/self-signed chains) break TLS verification.
+            # Retry without certificate verification so local demos continue to work.
+            return requests.get(target, timeout=timeout, headers=headers, allow_redirects=True, verify=False)
+        except Exception:
+            return None
+
+    response = _safe_get(url, timeout=10)
+    if response is None:
+        raise HTTPException(status_code=500, detail="Failed to fetch URL")
 
     if response.status_code != 200:
+        # Reuters often blocks bot traffic (401/403). Fall back to Reuters headlines via RSS.
+        host = urlparse(url).netloc.lower()
+        if "reuters.com" in host and response.status_code in (401, 403):
+            fallback_text = _google_news_fallback_text(url, headers)
+            if fallback_text:
+                return fallback_text
+        # Fallback: fetch readable mirror text for sites that block direct scraping.
+        parsed = urlparse(url)
+        stripped = f"{parsed.netloc}{parsed.path or ''}"
+        if parsed.query:
+            stripped += f"?{parsed.query}"
+        fallback_urls = [
+            f"https://r.jina.ai/http://{stripped}",
+            f"https://r.jina.ai/https://{stripped}",
+        ]
+        for fallback_url in fallback_urls:
+            fallback = _safe_get(fallback_url, timeout=15)
+            if fallback is not None and fallback.status_code == 200 and fallback.text.strip():
+                text = re.sub(r"\s+", " ", fallback.text).strip()
+                if text:
+                    return text
         raise HTTPException(
             status_code=502,
             detail=(
